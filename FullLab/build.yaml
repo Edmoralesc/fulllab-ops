@@ -1,0 +1,372 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: private
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: public
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: sc-public-api
+  namespace: public
+provisioner: microk8s.io/hostpath
+reclaimPolicy: Retain
+volumeBindingMode: WaitForFirstConsumer
+---
+apiVersion: v1
+data:
+  PRIVATE_API: http://svc-private-api.private.svc.cluster.local:3002/private
+kind: ConfigMap
+metadata:
+  name: cm-private-api
+  namespace: public
+---
+apiVersion: v1
+data:
+  CONFIG_JS: |
+    var config = (() => {
+      return {
+        API: "http://api.emoralesc.kubelabs.tk/graphql",
+        WEBSOCKET: "ws://websocket.emoralesc.kubelabs.tk/graphql",
+      };
+    })();
+kind: ConfigMap
+metadata:
+  name: cm-webpage-config
+  namespace: public
+---
+apiVersion: v1
+data:
+  TOKEN_SECRET: UEFTUwo=
+immutable: true
+kind: Secret
+metadata:
+  name: secret-token
+  namespace: public
+type: Opaque
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: svc-private-api
+  namespace: private
+spec:
+  ports:
+  - name: private-api
+    port: 3002
+    protocol: TCP
+    targetPort: 3002
+  selector:
+    app: private-api
+  type: ClusterIP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: svc-public-api
+  namespace: public
+spec:
+  ports:
+  - name: public-api
+    port: 3000
+    protocol: TCP
+    targetPort: 3000
+  selector:
+    app: public-api
+  type: ClusterIP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: svc-webpage
+  namespace: public
+spec:
+  ports:
+  - port: 80
+    targetPort: 8080
+  selector:
+    app: webpage
+  type: ClusterIP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: svc-websocket
+  namespace: public
+spec:
+  ports:
+  - name: websocket
+    port: 3001
+    protocol: TCP
+    targetPort: 3001
+  selector:
+    app: websocket
+  type: ClusterIP
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: pvc-public-api
+  namespace: public
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 50Mi
+  storageClassName: sc-public-api
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: deploy-private-api
+  namespace: private
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: private-api
+  template:
+    metadata:
+      labels:
+        app: private-api
+      name: private-api
+    spec:
+      containers:
+      - image: cachac/kubelabs_privateapi:2.0.0
+        livenessProbe:
+          httpGet:
+            path: /healthcheck
+            port: 3082
+          initialDelaySeconds: 10
+          periodSeconds: 30
+          timeoutSeconds: 5
+        name: private-api
+        ports:
+        - containerPort: 3002
+          name: private-api
+        - containerPort: 3082
+          name: healthcheck
+        readinessProbe:
+          httpGet:
+            path: /healthcheck
+            port: 3082
+          initialDelaySeconds: 10
+          periodSeconds: 30
+          timeoutSeconds: 5
+        resources:
+          limits:
+            cpu: 200m
+            memory: 200Mi
+          requests:
+            cpu: 100m
+            memory: 100Mi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: deploy-public-api
+  namespace: public
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: public-api
+  template:
+    metadata:
+      labels:
+        app: public-api
+      name: public-api
+    spec:
+      containers:
+      - envFrom:
+        - configMapRef:
+            name: cm-private-api
+        image: cachac/kubelabs_public_api:1.0.0
+        livenessProbe:
+          httpGet:
+            path: /healthcheck
+            port: 3080
+          initialDelaySeconds: 10
+          periodSeconds: 30
+          timeoutSeconds: 5
+        name: public-api
+        ports:
+        - containerPort: 3000
+          name: public-api
+        - containerPort: 3080
+          name: healthcheck
+        readinessProbe:
+          httpGet:
+            path: /healthcheck
+            port: 3080
+          initialDelaySeconds: 10
+          periodSeconds: 30
+          timeoutSeconds: 5
+        resources:
+          limits:
+            cpu: 200m
+            memory: 200Mi
+          requests:
+            cpu: 100m
+            memory: 100Mi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: deploy-webpage
+  namespace: public
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: webpage
+  strategy:
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 50%
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: webpage
+      name: webpage
+    spec:
+      containers:
+      - image: cachac/kubelabs_webapp:1.1.7
+        name: webpage
+        ports:
+        - containerPort: 8080
+        resources:
+          limits:
+            cpu: 100m
+            memory: 100Mi
+          requests:
+            cpu: 10m
+            memory: 50Mi
+        volumeMounts:
+        - mountPath: /usr/share/nginx/html/config.js
+          name: config-volume
+          readOnly: true
+          subPath: config.js
+      volumes:
+      - configMap:
+          items:
+          - key: CONFIG_JS
+            path: config.js
+          name: cm-webpage-config
+        name: config-volume
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: deploy-websocket
+  namespace: public
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: websocket
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: websocket
+      name: websocket
+    spec:
+      containers:
+      - envFrom:
+        - secretRef:
+            name: secret-token
+        image: cachac/kubelabs_websocket:1.0.6
+        livenessProbe:
+          httpGet:
+            path: /healthcheck
+            port: 3081
+          initialDelaySeconds: 10
+          periodSeconds: 30
+          timeoutSeconds: 5
+        name: websocket
+        ports:
+        - containerPort: 3001
+          name: websocket
+        - containerPort: 3081
+          name: healthcheck
+        readinessProbe:
+          httpGet:
+            path: /healthcheck
+            port: 3081
+          initialDelaySeconds: 10
+          periodSeconds: 30
+          timeoutSeconds: 5
+        resources:
+          limits:
+            cpu: 250m
+            memory: 200Mi
+          requests:
+            cpu: 100m
+            memory: 100Mi
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ingress-public-api
+  namespace: public
+spec:
+  rules:
+  - host: api.emoralesc.kubelabs.tk
+    http:
+      paths:
+      - backend:
+          service:
+            name: svc-public-api
+            port:
+              number: 3000
+        path: /graphql
+        pathType: Prefix
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ingress-webpage
+  namespace: public
+spec:
+  defaultBackend:
+    service:
+      name: svc-webpage
+      port:
+        number: 80
+  rules:
+  - host: emoralesc.kubelabs.tk
+    http:
+      paths:
+      - backend:
+          service:
+            name: svc-webpage
+            port:
+              number: 80
+        path: /
+        pathType: Prefix
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ingress-websocket
+  namespace: public
+spec:
+  rules:
+  - host: websocket.emoralesc.kubelabs.tk
+    http:
+      paths:
+      - backend:
+          service:
+            name: svc-websocket
+            port:
+              number: 3001
+        path: /graphql
+        pathType: Prefix
